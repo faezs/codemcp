@@ -1,6 +1,6 @@
 [project]
 name = "codemcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "MCP server for file operations"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,6 +20,7 @@ dependencies = [
     "uvicorn>=0.28.0",
     "starlette>=0.35.1",
     "google-genai>=1.10.0",
+    "pathspec>=0.12.1",
 ]
 
 [dependency-groups]
