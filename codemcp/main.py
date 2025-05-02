@@ -658,6 +658,45 @@ def init_codemcp_project(path: str, python: bool = False) -> str:
     else:
         print(f"Git repository already exists in {project_path}")
 
+    # Ensure Git user identity is configured for the repository
+    # This is especially important for CI environments
+    try:
+        # Check if user.name is set
+        name_result = subprocess.run(
+            ["git", "config", "user.name"],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if name_result.returncode != 0:
+            # Set a default user name if not configured
+            subprocess.run(
+                ["git", "config", "user.name", "CodeMCP User"],
+                cwd=project_path,
+                check=True,
+            )
+            print("Set default Git user name")
+
+        # Check if user.email is set
+        email_result = subprocess.run(
+            ["git", "config", "user.email"],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if email_result.returncode != 0:
+            # Set a default user email if not configured
+            subprocess.run(
+                ["git", "config", "user.email", "codemcp@example.com"],
+                cwd=project_path,
+                check=True,
+            )
+            print("Set default Git user email")
+    except Exception as e:
+        print(f"Warning: Could not configure Git user identity: {e}")
+
     # Select the appropriate template directory
     template_name = "python" if python else "blank"
     templates_dir = Path(__file__).parent / "templates" / template_name
@@ -784,6 +823,120 @@ def init(path: str, python: bool) -> None:
     """
     result = init_codemcp_project(path, python)
     click.echo(result)
+
+
+@cli.command()
+@click.argument("command", type=str)
+@click.argument("args", nargs=-1)
+@click.option("--path", type=click.Path(), default=".", help="Project directory path")
+def run(command: str, args: tuple, path: str) -> None:
+    """Run a command defined in codemcp.toml without doing git commits.
+
+    The command should be defined in the [commands] section of codemcp.toml.
+    Any additional arguments are passed to the command.
+
+    Examples:
+        codemcp run format
+        codemcp run test path/to/test_file.py
+    """
+    import asyncio
+    import os
+    import subprocess
+
+    import tomli
+
+    from .common import normalize_file_path
+    from .git_query import find_git_root
+
+    # Handle the async nature of the function in a sync context
+    asyncio.get_event_loop()
+
+    # Normalize path
+    full_path = normalize_file_path(path)
+
+    # Check if path exists
+    if not os.path.exists(full_path):
+        click.echo(f"Error: Path {path} does not exist", err=True)
+        return
+
+    # Check if it's a directory
+    if not os.path.isdir(full_path):
+        click.echo(f"Error: Path {path} is not a directory", err=True)
+        return
+
+    # First try to find codemcp.toml in the current directory
+    config_path = os.path.join(full_path, "codemcp.toml")
+
+    # If codemcp.toml is not in the current directory, traverse up to find the project root
+    if not os.path.exists(config_path):
+        # Use the existing find_git_root function to find the repository root
+        root_dir = find_git_root(full_path)
+        if root_dir:
+            # Check if codemcp.toml exists in the repository root
+            root_config_path = os.path.join(root_dir, "codemcp.toml")
+            if os.path.exists(root_config_path):
+                config_path = root_config_path
+                full_path = root_dir
+            else:
+                click.echo(
+                    f"Error: Config file not found in git repository root: {root_config_path}",
+                    err=True,
+                )
+                return
+        else:
+            click.echo(
+                f"Error: Not in a git repository and no codemcp.toml found in {full_path}",
+                err=True,
+            )
+            return
+
+    # Load command from config
+    try:
+        with open(config_path, "rb") as f:
+            config = tomli.load(f)
+
+        if "commands" not in config or command not in config["commands"]:
+            click.echo(
+                f"Error: Command '{command}' not found in codemcp.toml", err=True
+            )
+            exit(1)  # Exit with error code 1
+
+        cmd_config = config["commands"][command]
+        cmd_list = None
+
+        # Handle both direct command lists and dictionaries with 'command' field
+        if isinstance(cmd_config, list):
+            cmd_list = cmd_config
+        elif isinstance(cmd_config, dict) and "command" in cmd_config:
+            cmd_list = cmd_config["command"]
+        else:
+            click.echo(
+                f"Error: Invalid command configuration for '{command}'", err=True
+            )
+            exit(1)  # Exit with error code 1
+
+        # Add additional arguments if provided
+        if args:
+            cmd_list = list(cmd_list) + list(args)
+
+        # Run the command with inherited stdin/stdout/stderr
+        process = subprocess.run(
+            cmd_list,
+            cwd=full_path,
+            stdin=None,  # inherit
+            stdout=None,  # inherit
+            stderr=None,  # inherit
+            text=True,
+            check=False,  # Don't raise exception on non-zero exit codes
+        )
+
+        # Return the exit code
+        if process.returncode != 0:
+            exit(process.returncode)
+
+    except Exception as e:
+        click.echo(f"Error executing command: {e}", err=True)
+        exit(1)
 
 
 def create_sse_app(allowed_origins: Optional[List[str]] = None) -> Starlette:
