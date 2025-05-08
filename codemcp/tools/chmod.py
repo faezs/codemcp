@@ -2,11 +2,13 @@
 
 import os
 import stat
-from typing import Any, Literal
+from typing import Any
 
 from ..common import normalize_file_path
 from ..git import commit_changes
+from ..mcp import mcp
 from ..shell import run_command
+from .commit_utils import append_commit_hash
 
 __all__ = [
     "chmod",
@@ -17,8 +19,8 @@ __all__ = [
 
 TOOL_NAME_FOR_PROMPT = "Chmod"
 DESCRIPTION = """
-Changes file permissions using chmod. Unlike standard chmod, this tool only supports 
-a+x (add executable permission) and a-x (remove executable permission), because these 
+Changes file permissions using chmod. Unlike standard chmod, this tool only supports
+a+x (add executable permission) and a-x (remove executable permission), because these
 are the only bits that git knows how to track.
 
 Example:
@@ -27,21 +29,33 @@ Example:
 """
 
 
+@mcp.tool()
 async def chmod(
     path: str,
-    mode: Literal["a+x", "a-x"],
+    mode: str,
     chat_id: str | None = None,
-) -> dict[str, Any]:
-    """Change file permissions using chmod.
+    commit_hash: str | None = None,
+) -> str:
+    """Changes file permissions using chmod. Unlike standard chmod, this tool only supports
+    a+x (add executable permission) and a-x (remove executable permission), because these
+    are the only bits that git knows how to track.
 
     Args:
         path: The absolute path to the file to modify
         mode: The chmod mode to apply, only "a+x" and "a-x" are supported
-        chat_id: The unique ID of the current chat session
+        chat_id: The unique ID to identify the chat session
+        commit_hash: Optional Git commit hash for version tracking
+
+    Example:
+      chmod a+x path/to/file  # Makes a file executable by all users
+      chmod a-x path/to/file  # Makes a file non-executable for all users
 
     Returns:
-        A dictionary with chmod output
+        A formatted string with the chmod operation result
     """
+    # Set default values
+    chat_id = "" if chat_id is None else chat_id
+
     if not path:
         raise ValueError("File path must be provided")
 
@@ -67,16 +81,14 @@ async def chmod(
 
     if mode == "a+x" and is_executable:
         message = f"File '{path}' is already executable"
-        return {
-            "output": message,
-            "resultForAssistant": message,
-        }
+        # Append commit hash
+        message, _ = await append_commit_hash(message, directory, commit_hash)
+        return message
     elif mode == "a-x" and not is_executable:
         message = f"File '{path}' is already non-executable"
-        return {
-            "output": message,
-            "resultForAssistant": message,
-        }
+        # Append commit hash
+        message, _ = await append_commit_hash(message, directory, commit_hash)
+        return message
 
     # Execute chmod command
     cmd = ["chmod", mode, absolute_path]
@@ -102,21 +114,24 @@ async def chmod(
     success, commit_message = await commit_changes(
         directory,
         description,
-        chat_id if chat_id is not None else "",
+        chat_id,
     )
 
     if not success:
         raise RuntimeError(f"Failed to commit chmod changes: {commit_message}")
 
-    # Prepare output
-    output = {
-        "output": f"{action_msg} and committed changes",
-    }
+    # Prepare result string
+    result_string = f"{action_msg} and committed changes"
 
-    # Add formatted result for assistant
-    output["resultForAssistant"] = render_result_for_assistant(output)
+    # Format the result for assistant
+    formatted_result = render_result_for_assistant({"output": result_string})
 
-    return output
+    # Append commit hash
+    formatted_result, _ = await append_commit_hash(
+        formatted_result, directory, commit_hash
+    )
+
+    return formatted_result
 
 
 def render_result_for_assistant(output: dict[str, Any]) -> str:

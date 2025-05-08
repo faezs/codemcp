@@ -4,475 +4,28 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import click
 import pathspec
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
-from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
-from .common import normalize_file_path
-from .git_query import get_current_commit_hash
+from .mcp import mcp
 from .tools.chmod import chmod
-from .tools.edit_file import edit_file_content
-from .tools.glob import MAX_RESULTS, glob_files
-from .tools.grep import grep_files
+from .tools.edit_file import edit_file
+from .tools.glob import glob
+from .tools.grep import grep
 from .tools.init_project import init_project
-from .tools.ls import ls_directory
-from .tools.read_file import read_file_content
-from .tools.rm import rm_file
+from .tools.ls import ls
+from .tools.mv import mv
+from .tools.read_file import read_file
+from .tools.rm import rm
 from .tools.run_command import run_command
 from .tools.think import think
-from .tools.user_prompt import user_prompt as user_prompt_tool
-from .tools.write_file import write_file_content
-
-# Initialize FastMCP server
-mcp = FastMCP("codemcp")
-
-
-# Helper function to get the current commit hash and append it to a result string
-async def append_commit_hash(result: str, path: str | None) -> Tuple[str, str | None]:
-    """Get the current Git commit hash and append it to the result string.
-
-    Args:
-        result: The original result string to append to
-        path: Path to the Git repository (if available)
-
-    Returns:
-        A tuple containing:
-            - The result string with the commit hash appended
-            - The current commit hash if available, None otherwise
-    """
-    current_hash = None
-
-    if path is None:
-        return result, None
-
-    try:
-        current_hash = await get_current_commit_hash(path)
-        if current_hash:
-            return f"{result}\n\nCurrent commit hash: {current_hash}", current_hash
-    except Exception as e:
-        logging.warning(f"Failed to get current commit hash: {e}", exc_info=True)
-
-    return result, current_hash
-
-
-# NB: If you edit this, also edit codemcp/tools/init_project.py
-@mcp.tool()
-async def codemcp(
-    subtool: str,
-    *,
-    path: str | None = None,
-    content: str
-    | dict
-    | list
-    | None = None,  # Allow any type, will be serialized to string if needed
-    old_string: str | None = None,
-    new_string: str | None = None,
-    offset: int | None = None,
-    limit: int | None = None,
-    description: str | None = None,
-    pattern: str | None = None,
-    include: str | None = None,
-    command: str | None = None,
-    arguments: str | None = None,
-    old_str: str | None = None,  # Added because Claude often hallucinates this
-    new_str: str | None = None,  # Added because Claude often hallucinates this
-    chat_id: str | None = None,  # Added for chat identification
-    user_prompt: str | None = None,  # Added for InitProject commit message
-    subject_line: str | None = None,  # Added for InitProject commit message
-    reuse_head_chat_id: bool
-    | None = None,  # Whether to reuse the chat ID from the HEAD commit
-    thought: str | None = None,  # Added for Think tool
-    mode: str | None = None,  # Added for Chmod tool
-    commit_hash: str | None = None,  # Added for Git commit hash tracking
-) -> str:
-    # NOTE: Do NOT add more documentation to this docblock when you add a new
-    # tool, documentation for tools should go in codemcp/tools/init_project.py.
-    # This includes documentation for new parameters!  ONLY InitProject's
-    # parmaeters are documented here.
-    """If and only if the user explicitly asks you to initialize codemcp with
-    path, you should invoke this tool.  This will return instructions which you should
-    IMMEDIATELY follow before continuing, in particular, it will explain other ways
-    you can invoke this tool.
-
-    If the user indicates they want to "amend" or "continue working" on a PR,
-    you should set reuse_head_chat_id=True to continue using the same chat ID.
-
-    In each subsequent request NOT including the initial request to initialize
-    codemcp, you must call the UserPrompt tool with the user's verbatim
-    request text.
-
-    Arguments:
-      subtool: The subtool to run (InitProject, ...)
-      path: The path to the file or directory to operate on
-      user_prompt: The user's original prompt verbatim, starting AFTER instructions to initialize codemcp (e.g., you should exclude "Initialize codemcp for PATH")
-      subject_line: A short subject line in Git conventional commit format (for InitProject)
-      reuse_head_chat_id: If True, reuse the chat ID from the HEAD commit instead of generating a new one (for InitProject)
-      ... (there are other arguments which will be documented when you InitProject)
-    """
-    try:
-        # Define expected parameters for each subtool
-        expected_params = {
-            "ReadFile": {"path", "offset", "limit", "chat_id", "commit_hash"},
-            "WriteFile": {"path", "content", "description", "chat_id", "commit_hash"},
-            "EditFile": {
-                "path",
-                "old_string",
-                "new_string",
-                "description",
-                "old_str",
-                "new_str",
-                "chat_id",
-                "commit_hash",
-            },
-            "LS": {"path", "chat_id", "commit_hash"},
-            "InitProject": {
-                "path",
-                "user_prompt",
-                "subject_line",
-                "reuse_head_chat_id",
-            },  # chat_id is not expected for InitProject as it's generated there
-            "UserPrompt": {"user_prompt", "chat_id", "commit_hash"},
-            "RunCommand": {"path", "command", "arguments", "chat_id", "commit_hash"},
-            "Grep": {"pattern", "path", "include", "chat_id", "commit_hash"},
-            "Glob": {"pattern", "path", "limit", "offset", "chat_id", "commit_hash"},
-            "RM": {"path", "description", "chat_id", "commit_hash"},
-            "Think": {"thought", "chat_id", "commit_hash"},
-            "Chmod": {"path", "mode", "chat_id", "commit_hash"},
-        }
-
-        # Check if subtool exists
-        if subtool not in expected_params:
-            raise ValueError(
-                f"Unknown subtool: {subtool}. Available subtools: {', '.join(expected_params.keys())}"
-            )
-
-        # We no longer need to convert string arguments to list since run_command now only accepts strings
-
-        # Normalize string inputs to ensure consistent newlines
-        def normalize_newlines(s: object) -> object:
-            """Normalize string to use \n for all newlines."""
-            return s.replace("\r\n", "\n") if isinstance(s, str) else s
-
-        # Normalize content, old_string, and new_string to use consistent \n newlines
-        content_norm = normalize_newlines(content)
-        old_string_norm = normalize_newlines(old_string)
-        new_string_norm = normalize_newlines(new_string)
-        # Also normalize backward compatibility parameters
-        old_str_norm = normalize_newlines(old_str)
-        new_str_norm = normalize_newlines(new_str)
-        # And user prompt which might contain code blocks
-        user_prompt_norm = normalize_newlines(user_prompt)
-
-        # Get all provided non-None parameters
-        provided_params = {
-            param: value
-            for param, value in {
-                "path": path,
-                "content": content_norm,
-                "old_string": old_string_norm,
-                "new_string": new_string_norm,
-                "offset": offset,
-                "limit": limit,
-                "description": description,
-                "pattern": pattern,
-                "include": include,
-                "command": command,
-                "arguments": arguments,
-                # Include backward compatibility parameters
-                "old_str": old_str_norm,
-                "new_str": new_str_norm,
-                # Chat ID for session identification
-                "chat_id": chat_id,
-                # InitProject commit message parameters
-                "user_prompt": user_prompt_norm,
-                "subject_line": subject_line,
-                # Whether to reuse the chat ID from the HEAD commit
-                "reuse_head_chat_id": reuse_head_chat_id,
-                # Think tool parameter
-                "thought": thought,
-                # Chmod tool parameter
-                "mode": mode,
-                # Git commit hash tracking
-                "commit_hash": commit_hash,
-            }.items()
-            if value is not None
-        }
-
-        # Check for unexpected parameters
-        unexpected_params = set(provided_params.keys()) - expected_params[subtool]
-        if unexpected_params:
-            raise ValueError(
-                f"Unexpected parameters for {subtool} subtool: {', '.join(unexpected_params)}"
-            )
-
-        # Check for required chat_id for all tools except InitProject
-        if subtool != "InitProject" and chat_id is None:
-            raise ValueError(f"chat_id is required for {subtool} subtool")
-
-        # Now handle each subtool with its expected parameters
-        if subtool == "ReadFile":
-            if path is None:
-                raise ValueError("path is required for ReadFile subtool")
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            result = await read_file_content(normalized_path, offset, limit, chat_id)
-            result, new_commit_hash = await append_commit_hash(result, normalized_path)
-            return result
-
-        if subtool == "WriteFile":
-            if path is None:
-                raise ValueError("path is required for WriteFile subtool")
-            if description is None:
-                raise ValueError("description is required for WriteFile subtool")
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            import json
-
-            # If content is not a string, serialize it to a string using json.dumps
-            if content is not None and not isinstance(content, str):
-                content_str = json.dumps(content)
-            else:
-                content_str = content or ""
-
-            if chat_id is None:
-                raise ValueError("chat_id is required for WriteFile subtool")
-            result = await write_file_content(
-                normalized_path, content_str, description, chat_id
-            )
-            result, new_commit_hash = await append_commit_hash(result, normalized_path)
-            return result
-
-        if subtool == "EditFile":
-            if path is None:
-                raise ValueError("path is required for EditFile subtool")
-            if description is None:
-                raise ValueError("description is required for EditFile subtool")
-            if old_string is None and old_str is None:
-                # TODO: I want telemetry to tell me when this occurs.
-                raise ValueError(
-                    "Either old_string or old_str is required for EditFile subtool (use empty string for new file creation)"
-                )
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            # Accept either old_string or old_str (prefer old_string if both are provided)
-            old_content = old_string or old_str or ""
-            # Accept either new_string or new_str (prefer new_string if both are provided)
-            new_content = new_string or new_str or ""
-            if chat_id is None:
-                raise ValueError("chat_id is required for EditFile subtool")
-            result = await edit_file_content(
-                normalized_path, old_content, new_content, None, description, chat_id
-            )
-            result, new_commit_hash = await append_commit_hash(result, normalized_path)
-            return result
-
-        if subtool == "LS":
-            if path is None:
-                raise ValueError("path is required for LS subtool")
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            result = await ls_directory(normalized_path, chat_id)
-            result, new_commit_hash = await append_commit_hash(result, normalized_path)
-            return result
-
-        if subtool == "InitProject":
-            if path is None:
-                raise ValueError("path is required for InitProject subtool")
-            if user_prompt is None:
-                raise ValueError("user_prompt is required for InitProject subtool")
-            if subject_line is None:
-                raise ValueError("subject_line is required for InitProject subtool")
-            if reuse_head_chat_id is None:
-                reuse_head_chat_id = (
-                    False  # Default value in main.py only, not in the implementation
-                )
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            return await init_project(
-                normalized_path, user_prompt, subject_line, reuse_head_chat_id
-            )
-
-        if subtool == "RunCommand":
-            # When is something a command as opposed to a subtool?  They are
-            # basically the same thing, but commands are always USER defined.
-            # This means we shove them all in RunCommand so they are guaranteed
-            # not to conflict with codemcp's subtools.
-
-            if path is None:
-                raise ValueError("path is required for RunCommand subtool")
-            if command is None:
-                raise ValueError("command is required for RunCommand subtool")
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            # Ensure chat_id is provided
-            if chat_id is None:
-                raise ValueError("chat_id is required for RunCommand subtool")
-
-            # Ensure arguments is a string for run_command
-            args_str = (
-                arguments
-                if isinstance(arguments, str) or arguments is None
-                else " ".join(arguments)
-            )
-            result = await run_command(
-                normalized_path,
-                command,
-                args_str,
-                chat_id,
-            )
-            result, new_commit_hash = await append_commit_hash(result, normalized_path)
-            return result
-
-        if subtool == "Grep":
-            if pattern is None:
-                raise ValueError("pattern is required for Grep subtool")
-
-            if path is None:
-                raise ValueError("path is required for Grep subtool")
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            try:
-                grep_result = await grep_files(
-                    pattern, normalized_path, include, chat_id
-                )
-                result_string = grep_result.get(
-                    "resultForAssistant",
-                    f"Found {grep_result.get('numFiles', 0)} file(s)",
-                )
-                result, new_commit_hash = await append_commit_hash(
-                    result_string, normalized_path
-                )
-                return result
-            except Exception as e:
-                # Log the error but don't suppress it - let it propagate
-                logging.error(f"Exception in grep subtool: {e!s}", exc_info=True)
-                raise
-
-        if subtool == "Glob":
-            if pattern is None:
-                raise ValueError("pattern is required for Glob subtool")
-
-            if path is None:
-                raise ValueError("path is required for Glob subtool")
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            try:
-                glob_result = await glob_files(
-                    pattern,
-                    normalized_path,
-                    limit=limit if limit is not None else MAX_RESULTS,
-                    offset=offset if offset is not None else 0,
-                    chat_id=chat_id,
-                )
-                result_string = glob_result.get(
-                    "resultForAssistant",
-                    f"Found {glob_result.get('numFiles', 0)} file(s)",
-                )
-                result, new_commit_hash = await append_commit_hash(
-                    result_string, normalized_path
-                )
-                return result
-            except Exception as e:
-                # Log the error but don't suppress it - let it propagate
-                logging.error(f"Exception in glob subtool: {e!s}", exc_info=True)
-                raise
-
-        if subtool == "UserPrompt":
-            if user_prompt is None:
-                raise ValueError("user_prompt is required for UserPrompt subtool")
-
-            result = await user_prompt_tool(user_prompt, chat_id)
-            # UserPrompt doesn't need a path, but we might have one in the provided parameters
-            if path:
-                normalized_path = normalize_file_path(path)
-                result, new_commit_hash = await append_commit_hash(
-                    result, normalized_path
-                )
-            return result
-
-        if subtool == "RM":
-            if path is None:
-                raise ValueError("path is required for RM subtool")
-            if description is None:
-                raise ValueError("description is required for RM subtool")
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            if chat_id is None:
-                raise ValueError("chat_id is required for RM subtool")
-            result = await rm_file(normalized_path, description, chat_id)
-            result, new_commit_hash = await append_commit_hash(result, normalized_path)
-            return result
-
-        if subtool == "Think":
-            if thought is None:
-                raise ValueError("thought is required for Think subtool")
-
-            result = await think(thought, chat_id)
-            # Think doesn't need a path, but we might have one in the provided parameters
-            if path:
-                normalized_path = normalize_file_path(path)
-                result, new_commit_hash = await append_commit_hash(
-                    result, normalized_path
-                )
-            return result
-
-        if subtool == "Chmod":
-            if path is None:
-                raise ValueError("path is required for Chmod subtool")
-            if mode is None:
-                raise ValueError("mode is required for Chmod subtool")
-
-            # Normalize the path (expand tilde) before proceeding
-            normalized_path = normalize_file_path(path)
-
-            if chat_id is None:
-                raise ValueError("chat_id is required for Chmod subtool")
-
-            # Ensure mode is one of the valid literals
-            if mode not in ["a+x", "a-x"]:
-                raise ValueError("mode must be either 'a+x' or 'a-x' for Chmod subtool")
-
-            from typing import Literal, cast
-
-            chmod_mode = cast(Literal["a+x", "a-x"], mode)
-            chmod_result = await chmod(normalized_path, chmod_mode, chat_id)
-            result_string = chmod_result.get(
-                "resultForAssistant", "Chmod operation completed"
-            )
-            result, new_commit_hash = await append_commit_hash(
-                result_string, normalized_path
-            )
-            return result
-    except Exception:
-        logging.error("Exception", exc_info=True)
-        raise
-
-    # This should never be reached, but adding for type safety
-    return "Unknown subtool or operation"
+from .tools.write_file import write_file
 
 
 def get_files_respecting_gitignore(dir_path: Path, pattern: str = "**/*") -> List[Path]:
@@ -972,6 +525,23 @@ def create_sse_app(allowed_origins: Optional[List[str]] = None) -> Starlette:
 def run() -> None:
     """Run the MCP server."""
     configure_logging()
+
+    # Set up a signal handler to exit immediately on Ctrl+C
+    import os
+    import signal
+
+    def handle_exit(sig, frame):
+        logging.info(
+            "Received shutdown signal - exiting immediately without waiting for connections"
+        )
+        os._exit(0)
+
+    # Register for SIGINT (Ctrl+C) and SIGTERM
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    # The signal handler will force-exit the process when Ctrl+C is pressed
+    # so we don't need to worry about what happens inside mcp.run()
     mcp.run()
 
 
@@ -1004,4 +574,21 @@ def serve(host: str, port: int, cors_origin: List[str]) -> None:
         logging.info("Allowing CORS for: https://claude.ai")
 
     app = create_sse_app(allowed_origins)
-    uvicorn.run(app, host=host, port=port)
+
+    import os
+    import signal
+
+    # Register a custom signal handler that will take precedence and exit immediately
+    def handle_exit(sig, frame):
+        logging.info(
+            "Received shutdown signal - exiting immediately without waiting for connections"
+        )
+        os._exit(0)
+
+    # Register for SIGINT (Ctrl+C) and SIGTERM
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    # Start the server - even though we pass timeout_graceful_shutdown=0,
+    # our signal handler will execute first and terminate the process
+    uvicorn.run(app, host=host, port=port, timeout_graceful_shutdown=0)

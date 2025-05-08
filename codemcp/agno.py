@@ -25,6 +25,9 @@ async def serve_playground_app_async(
     prefix="/v1",
     **kwargs,
 ):
+    import os
+    import signal
+
     import uvicorn
 
     try:
@@ -56,13 +59,39 @@ async def serve_playground_app_async(
     # Print the panel
     console.print(panel)
 
-    config = uvicorn.Config(app=app, host=host, port=port, reload=reload, **kwargs)
+    # Define our custom signal handler that exits immediately
+    def handle_exit(sig, frame):
+        logger.info(
+            "Received shutdown signal - exiting immediately without waiting for connections"
+        )
+        os._exit(0)
+
+    # Register for SIGINT (Ctrl+C) and SIGTERM if this is running in the main thread
+    try:
+        signal.signal(signal.SIGINT, handle_exit)
+        signal.signal(signal.SIGTERM, handle_exit)
+    except ValueError:
+        # Can't set signal handlers in non-main threads
+        logger.warning("Can't set custom signal handlers in non-main thread")
+
+    # Configure uvicorn with timeout_graceful_shutdown=0 to minimize delay
+    # But our signal handler will exit first anyway
+    config = uvicorn.Config(
+        app=app,
+        host=host,
+        port=port,
+        reload=reload,
+        timeout_graceful_shutdown=0,
+        **kwargs,
+    )
     server = uvicorn.Server(config)
+
+    # Let the server run normally - our signal handler will take over on Ctrl+C
     await server.serve()
 
 
 async def main(hello_world: bool = False):
-    async with MCPTools(f"{sys.executable} -m codemcp.hot_reload_entry") as codemcp:
+    async with MCPTools(f"{sys.executable} -m codemcp") as codemcp:
         # TODO: cli-ify the model
         from agno.models.anthropic import Claude
 

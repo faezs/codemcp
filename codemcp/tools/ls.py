@@ -7,9 +7,11 @@ from typing import List, Optional
 from ..access import check_edit_permission
 from ..common import normalize_file_path
 from ..git import is_git_repository
+from ..mcp import mcp
+from .commit_utils import append_commit_hash
 
 __all__ = [
-    "ls_directory",
+    "ls",
     "list_directory",
     "skip",
     "TreeNode",
@@ -22,30 +24,38 @@ MAX_FILES = 1000
 TRUNCATED_MESSAGE = f"There are more than {MAX_FILES} files in the directory. Use more specific paths to explore nested directories. The first {MAX_FILES} files and directories are included below:\n\n"
 
 
-async def ls_directory(directory_path: str, chat_id: str | None = None) -> str:
-    """List the contents of a directory.
+@mcp.tool()
+async def ls(
+    path: str, chat_id: str | None = None, commit_hash: str | None = None
+) -> str:
+    """Lists files and directories in a given path. The path parameter must be an absolute path, not a relative path.
+    You should generally prefer the Glob and Grep tools, if you know which directories to search.
 
     Args:
-        directory_path: The absolute path to the directory to list
+        path: The absolute path to the directory to list
         chat_id: The unique ID of the current chat session
+        commit_hash: Optional Git commit hash for version tracking
 
     Returns:
         A formatted string representation of the directory contents
 
     """
+    # Set default values
+    chat_id = "" if chat_id is None else chat_id
+
     # Normalize the directory path
-    full_directory_path = normalize_file_path(directory_path)
+    full_directory_path = normalize_file_path(path)
 
     # Validate the directory path
     if not os.path.exists(full_directory_path):
-        raise FileNotFoundError(f"Directory does not exist: {directory_path}")
+        raise FileNotFoundError(f"Directory does not exist: {path}")
 
     if not os.path.isdir(full_directory_path):
-        raise NotADirectoryError(f"Path is not a directory: {directory_path}")
+        raise NotADirectoryError(f"Path is not a directory: {path}")
 
     # Safety check: Verify the directory is within a git repository with codemcp.toml
     if not await is_git_repository(full_directory_path):
-        raise ValueError(f"Directory is not in a Git repository: {directory_path}")
+        raise ValueError(f"Directory is not in a Git repository: {path}")
 
     # Check edit permission (which verifies codemcp.toml exists)
     is_permitted, permission_message = await check_edit_permission(full_directory_path)
@@ -63,9 +73,13 @@ async def ls_directory(directory_path: str, chat_id: str | None = None) -> str:
     tree_output = print_tree(tree, cwd=full_directory_path)
 
     # Return the result with truncation message if needed
-    if len(results) < MAX_FILES:
-        return tree_output
-    return f"{TRUNCATED_MESSAGE}{tree_output}"
+    output = tree_output
+    if len(results) >= MAX_FILES:
+        output = f"{TRUNCATED_MESSAGE}{tree_output}"
+
+    # Append commit hash
+    result, _ = await append_commit_hash(output, full_directory_path, commit_hash)
+    return result
 
 
 async def list_directory(initial_path: str) -> List[str]:

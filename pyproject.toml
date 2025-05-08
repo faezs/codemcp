@@ -39,7 +39,6 @@ dev = [
 
 [project.scripts]
 codemcp = "codemcp:cli"
-codemcp-multi = "codemcp.multi_entry:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -103,10 +102,6 @@ stubPackages = [
 
 # For testing code specific ignores
 [[tool.pyright.ignoreExtraErrors]]
-path = "codemcp/hot_reload_entry.py"
-errorCodes = ["reportUnknownMemberType"]
-
-[[tool.pyright.ignoreExtraErrors]]
 path = "codemcp/testing.py"
 errorCodes = ["reportUnknownMemberType", "reportUnknownArgumentType", "reportUnknownVariableType"]
 
@@ -121,7 +116,3 @@ errorCodes = ["reportUnknownMemberType", "reportUnknownArgumentType", "reportUnk
 [[tool.pyright.ignoreExtraErrors]]
 path = "codemcp/config.py"
 errorCodes = ["reportUnknownVariableType"]
-
-[[tool.pyright.ignoreExtraErrors]]
-path = "codemcp/multi_entry.py"
-errorCodes = ["reportUnknownParameterType", "reportUnknownArgumentType", "reportMissingTypeArgument"]

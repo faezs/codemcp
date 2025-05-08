@@ -3,14 +3,16 @@
 import logging
 import os
 import subprocess
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 from ..common import normalize_file_path
 from ..git import is_git_repository
+from ..mcp import mcp
 from ..shell import run_command
+from .commit_utils import append_commit_hash
 
 __all__ = [
-    "grep_files",
+    "grep",
     "git_grep",
     "render_result_for_assistant",
     "TOOL_NAME_FOR_PROMPT",
@@ -106,7 +108,7 @@ async def git_grep(
             cwd=absolute_path,
             capture_output=True,
             text=True,
-            check=False,  # Don't raise exception if git grep doesn't find matches
+            check=False,
         )
 
         # git grep returns exit code 1 when no matches are found, which is normal
@@ -143,77 +145,86 @@ def render_result_for_assistant(output: Dict[str, Any]) -> str:
 
     """
     num_files = output.get("numFiles", 0)
-    filenames = output.get("filenames", [])
+    matched_files = output.get("matchedFiles", [])
 
     if num_files == 0:
-        return "No files found"
+        return "No files found matching the pattern."
 
-    result = f"Found {num_files} file{'' if num_files == 1 else 's'}\n{os.linesep.join(filenames[:MAX_RESULTS])}"
-    if num_files > MAX_RESULTS:
-        result += (
-            "\n(Results are truncated. Consider using a more specific path or pattern.)"
-        )
+    result = f"Found {num_files} file(s) matching the pattern:\n\n"
+    for file_path in matched_files:
+        result += f"- {file_path}\n"
 
     return result
 
 
-async def grep_files(
+@mcp.tool()
+async def grep(
     pattern: str,
     path: str | None = None,
     include: str | None = None,
     chat_id: str | None = None,
-) -> dict[str, Any]:
-    """Search for a pattern in files within a directory or in a specific file.
+    commit_hash: str | None = None,
+) -> str:
+    """Searches for files containing a specified pattern (regular expression) using git grep.
+    Files with a match are returned, up to a maximum of 100 files.
+    Note that this tool only works inside git repositories.
+
+    Example:
+      Grep "function.*hello" /path/to/repo  # Find files containing functions with "hello" in their name
+      Grep "console\\.log" /path/to/repo --include="*.js"  # Find JS files with console.log statements
 
     Args:
         pattern: The regular expression pattern to search for
         path: The directory or file to search in (must be in a git repository)
         include: Optional file pattern to filter the search
         chat_id: The unique ID of the current chat session
+        commit_hash: Optional Git commit hash for version tracking
 
     Returns:
-        A dictionary with matched files
+        A formatted string with the search results
 
     """
+    try:
+        # Set default values
+        chat_id = "" if chat_id is None else chat_id
 
-    # Execute git grep asynchronously
-    matches = await git_grep(pattern, path, include)
+        # Default to current directory if path is not provided
+        path = "." if path is None else path
 
-    # Sort matches
-    # Use asyncio for getting file stats
-    import asyncio
+        # Normalize the path
+        normalized_path = normalize_file_path(path)
 
-    loop = asyncio.get_event_loop()
+        # Execute git grep
+        matched_files = await git_grep(pattern, normalized_path, include)
 
-    # Get file stats asynchronously
-    stats: List[Optional[os.stat_result]] = []
-    for match in matches:
-        file_stat = await loop.run_in_executor(
-            None, lambda m=match: os.stat(m) if os.path.exists(m) else None
-        )
-        stats.append(file_stat)
+        # Limit the number of results
+        truncated = len(matched_files) > MAX_RESULTS
+        matched_files = matched_files[:MAX_RESULTS]
 
-    matches_with_stats: List[Tuple[str, Optional[os.stat_result]]] = list(
-        zip(matches, stats, strict=False)
-    )
+        # Prepare output
+        output = {
+            "numFiles": len(matched_files),
+            "matchedFiles": matched_files,
+            "truncated": truncated,
+            "pattern": pattern,
+            "path": path,
+            "include": include,
+        }
 
-    # In tests, sort by filename for deterministic results
-    if os.environ.get("NODE_ENV") == "test":
-        matches_with_stats.sort(key=lambda x: x[0])
-    else:
-        # Sort by modification time (newest first), with filename as tiebreaker
-        matches_with_stats.sort(key=lambda x: (-(x[1].st_mtime if x[1] else 0), x[0]))
+        # Add formatted result for assistant
+        result_for_assistant = render_result_for_assistant(output)
 
-    matches = [match for match, _ in matches_with_stats]
+        # Append commit hash
+        if normalized_path:
+            result_for_assistant, _ = await append_commit_hash(
+                result_for_assistant, normalized_path, commit_hash
+            )
 
-    # Prepare output
-    output: Dict[str, Any] = {
-        "filenames": matches[:MAX_RESULTS],
-        "numFiles": len(matches),
-    }
+        return result_for_assistant
+    except Exception as e:
+        # Log the error
+        logging.error(f"Error in grep: {e}", exc_info=True)
 
-    # Add formatted result for assistant
-    formatted_result = render_result_for_assistant(output)
-    output["resultForAssistant"] = formatted_result
-
-    return output
+        # Return error message
+        error_message = f"Error searching for pattern: {e}"
+        return error_message
